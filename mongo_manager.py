@@ -1,108 +1,113 @@
-"""Encrypted registry and health checks for additional MongoDB Atlas clusters.
-
-This module deliberately does NOT shard the bot's existing collections. It manages
-connections safely; collection-level routing requires a separate migration-aware
-storage adapter and is not enabled by this release.
-"""
-from __future__ import annotations
-import hashlib
-from datetime import datetime, timezone
-from typing import Any
-from cryptography.fernet import Fernet, InvalidToken
-from motor.motor_asyncio import AsyncIOMotorClient
-from pymongo.errors import PyMongoError
+from pyrogram import Client, filters
+from pyrogram.types import Message
 
 
-class MongoClusterManager:
-    def __init__(self, control_uri: str, control_db_name: str, encryption_key: str):
-        if not control_uri:
-            raise ValueError("MONGO_CONTROL_URI is required")
-        if not encryption_key:
-            raise ValueError("MONGO_ENCRYPTION_KEY is required")
-        self.control_client = AsyncIOMotorClient(control_uri, serverSelectionTimeoutMS=8000)
-        self.control_db = self.control_client[control_db_name]
-        self.registry = self.control_db["mongo_cluster_registry"]
-        self.fernet = Fernet(encryption_key.encode())
-        self._clients: dict[str, AsyncIOMotorClient] = {}
+def _owner(client, message):
+    return message.from_user and message.from_user.id == client.owner
 
-    @staticmethod
-    def fingerprint(uri: str) -> str:
-        return hashlib.sha256(uri.strip().encode()).hexdigest()
 
-    async def add(self, uri: str, label: str) -> tuple[str, str]:
-        uri = uri.strip()
-        if not uri.startswith(("mongodb://", "mongodb+srv://")):
-            raise ValueError("URI must start with mongodb:// or mongodb+srv://")
-        key = self.fingerprint(uri)
-        if await self.registry.find_one({"_id": key}):
-            raise ValueError("This MongoDB URI is already registered")
-        test_client = AsyncIOMotorClient(uri, serverSelectionTimeoutMS=8000)
+@Client.on_message(filters.private & filters.command("mongo"))
+async def mongo_help(client: Client, message: Message):
+    if not _owner(client, message):
+        return await message.reply("Owner only.")
+    if client.mongo_manager is None:
+        return await message.reply("Mongo manager is disabled. Set MONGO_ENCRYPTION_KEY and MONGO_CONTROL_URI.")
+    await message.reply_text(
+        "<b>Riku MongoDB Manager</b>\n\n"
+        "/mongo_add — register and ping-test a cluster\n"
+        "/mongo_list — list registered clusters\n"
+        "/mongo_test ID — test a cluster\n"
+        "/mongo_on ID — enable in registry\n"
+        "/mongo_off ID — disable in registry\n"
+        "/mongo_remove ID — remove registry entry\n\n"
+        "<i>Note: this release registers and monitors connections only. It does not yet route existing bot collections across clusters.</i>"
+    )
+
+
+@Client.on_message(filters.private & filters.command("mongo_add"))
+async def mongo_add(client: Client, message: Message):
+    if not _owner(client, message):
+        return await message.reply("Owner only.")
+    if client.mongo_manager is None:
+        return await message.reply("Mongo manager is disabled. Configure MONGO_ENCRYPTION_KEY.")
+    await message.reply("Send a label for this cluster (example: Atlas-02).", quote=True)
+    try:
+        label_msg = await client.ask(chat_id=message.chat.id, text="Send a label for this cluster (example: Atlas-02).", filters=filters.text, timeout=90)
+        label = (label_msg.text or "").strip()
+        if not label:
+            return await message.reply("Invalid label. Cancelled.")
+        await message.reply("Now send the MongoDB connection URI in this private chat. It will be encrypted before storage.")
+        uri_msg = await client.ask(chat_id=message.chat.id, text="Send the MongoDB connection URI in this private chat.", filters=filters.text, timeout=120)
+        uri = (uri_msg.text or "").strip()
+        if not uri:
+            return await message.reply("No URI received. Cancelled.")
+        result = await client.mongo_manager.add(uri, label)
         try:
-            await test_client.admin.command("ping")
-        finally:
-            test_client.close()
-        encrypted = self.fernet.encrypt(uri.encode()).decode()
-        await self.registry.insert_one({
-            "_id": key,
-            "label": label[:60],
-            "uri_encrypted": encrypted,
-            "active": True,
-            "created_at": datetime.now(timezone.utc),
-            "last_check": datetime.now(timezone.utc),
-            "status": "healthy",
-        })
-        return key[:12], "healthy"
+            await uri_msg.delete()
+        except Exception:
+            pass
+        await message.reply(f"✅ Registered <b>{label}</b>\nID: <code>{result[0]}</code>\nStatus: {result[1]}")
+    except Exception as exc:
+        await message.reply(f"❌ Could not add cluster: <code>{str(exc)[:300]}</code>")
 
-    async def list_clusters(self) -> list[dict[str, Any]]:
-        rows = []
-        async for item in self.registry.find({}, {"uri_encrypted": 0}).sort("created_at", 1):
-            item["short_id"] = item["_id"][:12]
-            rows.append(item)
-        return rows
 
-    async def _uri_for(self, key: str) -> str:
-        item = await self.registry.find_one({"_id": key})
-        if not item:
-            raise ValueError("Cluster not found")
-        try:
-            return self.fernet.decrypt(item["uri_encrypted"].encode()).decode()
-        except InvalidToken as exc:
-            raise RuntimeError("Cannot decrypt saved URI; check MONGO_ENCRYPTION_KEY") from exc
+@Client.on_message(filters.private & filters.command("mongo_list"))
+async def mongo_list(client: Client, message: Message):
+    if not _owner(client, message):
+        return await message.reply("Owner only.")
+    if client.mongo_manager is None:
+        return await message.reply("Mongo manager is disabled. Configure MONGO_ENCRYPTION_KEY.")
+    try:
+        rows = await client.mongo_manager.list_clusters()
+        if not rows:
+            return await message.reply("No additional MongoDB clusters registered yet.")
+        lines = ["<b>Registered MongoDB clusters</b>"]
+        for row in rows:
+            lines.append(f"• <b>{row.get('label','Unnamed')}</b> — <code>{row['short_id']}</code> — {'ON' if row.get('active') else 'OFF'} — {row.get('status','unknown')}")
+        for start in range(0, len(lines), 35):
+            await message.reply("\n".join(lines[start:start+35]))
+    except Exception as exc:
+        await message.reply(f"Registry error: <code>{str(exc)[:250]}</code>")
 
-    async def test(self, short_id: str) -> tuple[bool, str]:
-        item = await self.registry.find_one({"_id": {"$regex": f"^{short_id}"}})
-        if not item:
-            return False, "Cluster not found"
-        uri = self.fernet.decrypt(item["uri_encrypted"].encode()).decode()
-        client = AsyncIOMotorClient(uri, serverSelectionTimeoutMS=8000)
-        try:
-            await client.admin.command("ping")
-            await self.registry.update_one({"_id": item["_id"]}, {"$set": {"status": "healthy", "last_check": datetime.now(timezone.utc)}})
-            return True, "Connection successful"
-        except Exception as exc:
-            await self.registry.update_one({"_id": item["_id"]}, {"$set": {"status": "error", "last_check": datetime.now(timezone.utc)}})
-            return False, str(exc)[:250]
-        finally:
-            client.close()
 
-    async def set_active(self, short_id: str, active: bool) -> bool:
-        result = await self.registry.update_one(
-            {"_id": {"$regex": f"^{short_id}"}}, {"$set": {"active": active}}
-        )
-        return result.modified_count > 0 or result.matched_count > 0
+async def _cluster_action(client, message, action):
+    if not _owner(client, message):
+        return await message.reply("Owner only.")
+    if client.mongo_manager is None:
+        return await message.reply("Mongo manager is disabled. Configure MONGO_ENCRYPTION_KEY.")
+    args = message.text.split(maxsplit=1)
+    if len(args) != 2:
+        return await message.reply(f"Usage: /mongo_{action} CLUSTER_ID")
+    short_id = args[1].strip()
+    try:
+        if action == "test":
+            ok, detail = await client.mongo_manager.test(short_id)
+            return await message.reply(("✅ " if ok else "❌ ") + detail)
+        if action in ("on", "off"):
+            ok = await client.mongo_manager.set_active(short_id, action == "on")
+            return await message.reply("✅ Updated." if ok else "Cluster not found.")
+        if action == "remove":
+            ok = await client.mongo_manager.remove(short_id)
+            return await message.reply("✅ Registry entry removed." if ok else "Cluster not found.")
+    except Exception as exc:
+        await message.reply(f"❌ {str(exc)[:250]}")
 
-    async def remove(self, short_id: str) -> bool:
-        item = await self.registry.find_one({"_id": {"$regex": f"^{short_id}"}})
-        if not item:
-            return False
-        await self.registry.delete_one({"_id": item["_id"]})
-        client = self._clients.pop(item["_id"], None)
-        if client:
-            client.close()
-        return True
 
-    async def close(self):
-        for client in self._clients.values():
-            client.close()
-        self._clients.clear()
-        self.control_client.close()
+@Client.on_message(filters.private & filters.command("mongo_test"))
+async def mongo_test(client, message):
+    await _cluster_action(client, message, "test")
+
+
+@Client.on_message(filters.private & filters.command("mongo_on"))
+async def mongo_on(client, message):
+    await _cluster_action(client, message, "on")
+
+
+@Client.on_message(filters.private & filters.command("mongo_off"))
+async def mongo_off(client, message):
+    await _cluster_action(client, message, "off")
+
+
+@Client.on_message(filters.private & filters.command("mongo_remove"))
+async def mongo_remove(client, message):
+    await _cluster_action(client, message, "remove")
