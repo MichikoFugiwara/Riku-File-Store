@@ -1,7 +1,7 @@
 ━━━━━━━━━━━━━━━━━━━━
 
 <h2 align="center">
-    ──「 ғɪʟᴇ sᴛᴏʀᴇ ᴘʀᴏ - ʙʏ ʏᴀᴛᴏ 」──
+    ──「 RIKU FILE STORE - BY ANIME WATCHER 」──
 </h2>
 
 <p align="center">
